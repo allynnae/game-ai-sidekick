@@ -108,3 +108,27 @@ Frameworks or tools include Visual Studio Code, Git, Python, Pip, and Pygame.
 - Make sure to restart your terminal after adding the key
 - Troubleshooting: visit [Google Gemini](https://ai.google.dev/gemini-api/docs/api-key) or [OpenAI](https://platform.openai.com/docs/quickstart)
 - The current release uses gpt-4.1 and gemini-2.0-flash.
+
+## PA4 Update
+
+- **For gpt-4.1**
+
+```bash
+python -m wordle.src.llm_tests \
+    --llm-platform openai \
+    --openai-model gpt-4.1 \
+    --num-runs 10 \
+    --wandb-mode online \
+    --wandb-name "gpt4.1-10runs"
+```
+
+- **For gemma2**
+
+```bash
+python -m wordle.src.llm_tests \
+    --llm-platform ollama \
+    --ollama-model gemma2:2b \
+    --num-runs 100 \
+    --wandb-mode online \
+    --wandb-name "ollama-gemma2-2b-100"
+```
