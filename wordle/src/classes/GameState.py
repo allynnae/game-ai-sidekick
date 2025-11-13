@@ -2,9 +2,11 @@ import os
 import random
 import re
 import threading
+import time
 import requests
 from enum import Enum
 from threading import Timer
+from typing import Any
 
 import pygame
 from firebase_admin.firestore import firestore
@@ -29,6 +31,29 @@ from visuals.man_screen import man_screen
 from visuals.start_screen import *
 
 
+def _message_content_length(content: Any) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for chunk in content:
+            if isinstance(chunk, dict):
+                total += len(str(chunk.get("text", "")))
+            else:
+                total += len(str(chunk))
+        return total
+    if isinstance(content, dict):
+        return len(str(content.get("text", "")))
+    return len(str(content))
+
+
+def _prompt_char_length(messages: list[dict[str, Any]]) -> int:
+    total = 0
+    for message in messages:
+        total += _message_content_length(message.get("content", ""))
+    return total
+
+
 class Status(Enum):
     start = 0
     config = 1
@@ -39,7 +64,18 @@ class Status(Enum):
 
 # class to hold the game state
 class GameState:
-    def __init__(self, show_window: bool = True, disable_animations: bool = False, logging: bool = True):
+    def __init__(
+        self,
+        show_window: bool = True,
+        disable_animations: bool = False,
+        logging: bool = True,
+        *,
+        llm_platform: str | None = None,
+        llm_model: str | None = None,
+        ollama_model: str | None = None,
+        openrouter_model: str | None = None,
+        max_llm_calls: int | None = None
+    ):
         self.db: firestore.Client | None = None
 
         self.api_key_valid: bool = True
@@ -77,7 +113,11 @@ class GameState:
         self.current_word_index = 0
         self.was_valid_guess = False
 
-        self.llm_platform = LLM_PLATFORM
+        self.llm_platform = llm_platform or LLM_PLATFORM
+        self.llm_model = llm_model or LLM_MODEL
+        self.ollama_model = ollama_model or OLLAMA_MODEL
+        self.openrouter_model = openrouter_model or OPENROUTER_MODEL
+        self.max_llm_calls = max_llm_calls or MAX_LLM_CONTINUOUS_CALLS
         
         
         self.ai_client: OpenAI | None = None
@@ -285,8 +325,18 @@ class GameState:
         if letters_to_add == WORD_LENGTH and check:
             self.handle_check_word()
 
-    def enter_word_from_ai(self, messages: list[ChatCompletionMessageParam] | None = None, calls: int = 0):
+    def enter_word_from_ai(self, messages: list[ChatCompletionMessageParam] | None = None, calls: int = 0, metrics: dict | None = None):
         self.ai_loading = True
+        metrics = metrics or {
+            "llm_calls": 0,
+            "call_latencies": [],
+            "prompt_sizes": []
+        }
+
+        def record_call_metrics(start_time: float, prompt_chars: int):
+            metrics["llm_calls"] += 1
+            metrics["call_latencies"].append(time.time() - start_time)
+            metrics["prompt_sizes"].append(prompt_chars)
 
         try:
             messages = messages or generate_messages(
@@ -305,48 +355,57 @@ class GameState:
 
             if self.llm_platform == "gemini":
                 if not self.gemini_client:
-                    return
+                    return metrics
 
                 contents = "\n".join(map(
                     lambda message: message["content"], messages))
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion = self.gemini_client.models.generate_content(
                     model="gemini-2.0-flash",
                     contents=contents
                 )
                 org_response = completion.text
+                record_call_metrics(call_start, prompt_chars)
 
             elif self.llm_platform == "openai":
                 if not self.ai_client:
-                    return
+                    return metrics
 
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion = self.ai_client.chat.completions.create(
-                    model=LLM_MODEL,
+                    model=self.llm_model,
                     messages=messages,
                 )
                 org_response = str(
                     completion.choices[0].message.content
                 )
+                record_call_metrics(call_start, prompt_chars)
                 
             elif self.llm_platform == "openrouter":
                 if not self.ai_client:
-                    return
+                    return metrics
 
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion = self.ai_client.chat.completions.create(
                     extra_headers={
                         "HTTP-Referer": "https://github.com/tm033520/game-ai-sidekick",
                         "X-Title": "Wordle AI Sidekick",
                     },
                     extra_body={},
-                    model=OPENROUTER_MODEL,
+                    model=self.openrouter_model,
                     messages=messages,
                 )
                 org_response = str(
                     completion.choices[0].message.content
                 )
+                record_call_metrics(call_start, prompt_chars)
                 
             elif self.llm_platform == "grok":
                 if not self.grok_key:
-                    return
+                    return metrics
                     
                 headers = {
                     "Authorization": f"Bearer {self.grok_key}",
@@ -360,16 +419,21 @@ class GameState:
                     "max_tokens": 50,
                     "temperature": 0.3
                 }
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 r = requests.post("https://openrouter.ai/api/v1/chat/completions",
                                 headers=headers, json=payload, timeout=60)
                 r.raise_for_status()
                 data = r.json()
                 org_response = data["choices"][0]["message"]["content"]
+                record_call_metrics(call_start, prompt_chars)
 
             elif self.llm_platform == "deepseek":
                 if not self.deepseek_client:
-                    return
+                    return metrics
 
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion = self.deepseek_client.chat.completions.create(
                     model=DEEPSEEK_MODEL,
                     messages=messages,
@@ -377,26 +441,30 @@ class GameState:
                 org_response = str(
                     completion.choices[0].message.content
                 )
+                record_call_metrics(call_start, prompt_chars)
 
             elif self.llm_platform == "openrouter":
                 if not self.ai_client:
-                    return
+                    return metrics
 
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion = self.ai_client.chat.completions.create(
                     extra_headers={
                         "HTTP-Referer": "https://github.com/tm033520/game-ai-sidekick",
                         "X-Title": "Wordle AI Sidekick",
                     },
                     extra_body={},
-                    model=OPENROUTER_MODEL,
+                    model=self.openrouter_model,
                     messages=messages,
                 )
                 org_response = str(
                     completion.choices[0].message.content
                 )
+                record_call_metrics(call_start, prompt_chars)
             elif self.llm_platform == "grok":
                 if not self.grok_key:
-                    return
+                    return metrics
                     
                 headers = {
                     "Authorization": f"Bearer {self.grok_key}",
@@ -410,18 +478,24 @@ class GameState:
                     "max_tokens": 50,
                     "temperature": 0.3
                 }
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 r = requests.post("https://openrouter.ai/api/v1/chat/completions",
                                 headers=headers, json=payload, timeout=60)
                 r.raise_for_status()
                 data = r.json()
                 org_response = data["choices"][0]["message"]["content"]
+                record_call_metrics(call_start, prompt_chars)
 
             elif self.llm_platform == "ollama":
+                prompt_chars = _prompt_char_length(messages)
+                call_start = time.time()
                 completion: ChatResponse = chat(
-                    model=OLLAMA_MODEL,
+                    model=self.ollama_model,
                     messages=messages
                 )
                 org_response = str(completion.message.content)
+                record_call_metrics(call_start, prompt_chars)
 
             if LOG_LLM_MESSAGES:
                 with open("./llm_chat_log.txt", "a") as f:
@@ -439,10 +513,11 @@ class GameState:
             if len(completion_message) == WORD_LENGTH:
                 reasons = self.solver.reason_guess(completion_message)
                 messages.append({"role": "assistant", "content": org_response})
+                metrics["made_guess"] = True
 
-                if len(reasons) > 0 and calls < MAX_LLM_CONTINUOUS_CALLS and self.num_lies == 0:
+                if len(reasons) > 0 and calls < self.max_llm_calls and self.num_lies == 0:
                     messages.append(generate_guess_reasoning(reasons))
-                    self.enter_word_from_ai(messages, calls + 1)
+                    return self.enter_word_from_ai(messages, calls + 1, metrics)
                 else:
                     print(org_response)
                     self.total_llm_guesses.append({
@@ -456,9 +531,11 @@ class GameState:
                     })
                     self.enter_word_from_solver(
                         completion_message, check=(not self.show_window))
+                    return metrics
             else:
                 self.was_valid_guess = False
                 print("Error: AI did not return a valid guess")
+                return metrics
 
         except Exception as e:
             self.error_message = str(e)
@@ -469,8 +546,10 @@ class GameState:
                 print(e)
             else:
                 raise e
+        finally:
+            self.ai_loading = False
 
-        self.ai_loading = False
+        return metrics
 
     def set_llm_platform(self, llm: str):
         self.api_key_valid = True  # reset api key valid
